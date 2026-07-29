@@ -3682,6 +3682,19 @@ FILE is the file path to read."
      mcp-server-lib-ert-server-id))
    :type 'mcp-server-lib-tool-error))
 
+(defun org-mcp-test--should-get-agenda-day-error ()
+  "Call org-get-agenda for a day view; assert a JSON-RPC error response.
+For builds failing with a generic signal, which surfaces as a JSON-RPC
+internal error rather than the tool error
+`org-mcp-test--get-agenda-expecting-error' expects."
+  (should
+   (alist-get
+    'error
+    (mcp-server-lib-process-jsonrpc-parsed
+     (mcp-server-lib-create-tools-call-request
+      "org-get-agenda" 1 '((view . "day")))
+     mcp-server-lib-ert-server-id))))
+
 (defmacro org-mcp-test--with-custom-agenda-result
     (custom-commands view &rest body)
   "Run org-get-agenda for VIEW over the tagged fixture with CUSTOM-COMMANDS.
@@ -4966,23 +4979,134 @@ from outside the allow-list into the result."
               (should-not (string-match "On reference day" agenda))))
         (delete-directory foreign-dir t)))))
 
-(defun org-mcp-test--agenda-list-leak-buffer-then-signal (&rest _)
-  "Create the agenda tmp buffer, then signal; a hostile `org-agenda-list' stub.
-Leaves the buffer behind so the test can assert error-path cleanup kills
-it."
-  (get-buffer-create org-agenda-buffer-tmp-name)
-  (error "Simulated agenda failure"))
-
 (ert-deftest org-mcp-test-tool-get-agenda-cleans-buffer-on-error ()
-  "Test `org-mcp--agenda-buffer-text' reclaims its buffer on a build error.
-Pins error-path cleanup: if `org-agenda-list' signals after creating
-the private agenda buffer, `org-mcp--agenda-buffer-text' must kill it
-rather than leak a hidden buffer."
-  (cl-letf (((symbol-function 'org-agenda-list)
-             #'org-mcp-test--agenda-list-leak-buffer-then-signal))
-    (should-error
-     (org-mcp--agenda-buffer-text '("/no/such/file.org") nil 'day))
-    (should-not (get-buffer org-mcp--agenda-buffer-name))))
+  "Test org-get-agenda reclaims its private buffer on a build error.
+Pins error-path cleanup: if the agenda build signals after creating
+the private agenda buffer, the tool must report an error and kill the
+buffer rather than leak it hidden.  The stub records the per-call
+buffer name it was given, so the closing assertion targets the buffer
+this call actually created rather than the base-name constant."
+  (org-mcp-test--with-temp-org-files
+      ((agenda-file org-mcp-test--agenda-basic-content))
+    (let ((leaked-buffer-name nil))
+      (cl-letf (((symbol-function 'org-agenda-list)
+                 (lambda (&rest _)
+                   (setq leaked-buffer-name
+                         org-agenda-buffer-tmp-name)
+                   (get-buffer-create leaked-buffer-name)
+                   (error "Simulated agenda failure"))))
+        (org-mcp-test--should-get-agenda-day-error)
+        (should-not (get-buffer leaked-buffer-name))))))
+
+(ert-deftest org-mcp-test-tool-get-agenda-releases-opened-file-buffers
+    ()
+  "Test org-get-agenda kills the file buffers it opened for the build.
+Pins the fix for the file-buffer leak: the agenda build visited allowed
+files not already open and pushed their buffers onto the user's global
+`org-agenda-new-buffers', where they lived until the user's own
+`org-agenda-exit' killed them en masse."
+  (org-mcp-test--with-temp-org-files
+      ((agenda-file org-mcp-test--agenda-basic-content))
+    (let ((org-agenda-new-buffers nil))
+      (org-mcp-test--call-get-agenda '((view . "day")))
+      (should-not org-agenda-new-buffers)
+      (should-not (find-buffer-visiting agenda-file)))))
+
+(ert-deftest org-mcp-test-tool-get-agenda-leaves-user-buffer-open ()
+  "Test org-get-agenda leaves an already-open file buffer untouched.
+Pins the guarantee that only buffers the build itself opened are
+released: a buffer already visiting an agenda file before the call
+must survive it live and unmodified, and must not be handed to
+`org-agenda-new-buffers' for the user's later agenda cleanup to kill."
+  (org-mcp-test--with-temp-org-files
+      ((agenda-file org-mcp-test--agenda-basic-content))
+    (org-mcp-test--with-file-buffer buf agenda-file
+      (let ((org-agenda-new-buffers nil))
+        (org-mcp-test--call-get-agenda '((view . "day")))
+        (should (eq (find-buffer-visiting agenda-file) buf))
+        (should-not (buffer-modified-p buf))
+        (should-not (memq buf org-agenda-new-buffers))))))
+
+(defun org-mcp-test--modify-found-file ()
+  "Append a line to the just-visited file buffer, leaving it modified.
+`find-file-hook' member for tests that need a buffer opened by the
+agenda build to carry unsaved modifications."
+  (save-excursion
+    (goto-char (point-max))
+    (insert "# modified by test\n")))
+
+(defmacro org-mcp-test--asserting-modified-buffer-handoff (&rest body)
+  "Run BODY over an agenda file a hook modifies on visit; assert handoff.
+Binds `agenda-file' to a temp file holding the basic agenda fixture and
+`org-agenda-new-buffers' to nil, installs
+`org-mcp-test--modify-found-file' on `find-file-hook', runs BODY (which
+must trigger an agenda build), then asserts the buffer visiting
+`agenda-file' survived still modified and was handed to
+`org-agenda-new-buffers'.  Kills the buffer, discarding the
+modification, on exit."
+  (declare (indent 0) (debug t))
+  `(org-mcp-test--with-temp-org-files
+       ((agenda-file org-mcp-test--agenda-basic-content))
+     (let ((org-agenda-new-buffers nil)
+           (find-file-hook
+            (cons #'org-mcp-test--modify-found-file find-file-hook)))
+       (unwind-protect
+           (progn
+             ,@body
+             (let ((buf (find-buffer-visiting agenda-file)))
+               (should (memq buf org-agenda-new-buffers))
+               (should (buffer-modified-p buf))))
+         (when-let* ((buf (find-buffer-visiting agenda-file)))
+           (with-current-buffer buf
+             (set-buffer-modified-p nil))
+           (kill-buffer buf))))))
+
+(ert-deftest org-mcp-test-tool-get-agenda-hands-off-modified-buffer ()
+  "Test org-get-agenda spares a buffer that was modified during the build.
+Killing a modified file buffer demands interactive confirmation, which
+would hang the MCP request; such a buffer must instead survive the call
+and be handed to `org-agenda-new-buffers' for the user's own agenda
+cleanup."
+  (org-mcp-test--asserting-modified-buffer-handoff
+    (org-mcp-test--call-get-agenda '((view . "day")))))
+
+(ert-deftest org-mcp-test-tool-get-agenda-hands-off-modified-on-error
+    ()
+  "Test the modified-buffer handoff also runs when the build signals.
+Pins the error path of the handoff: a buffer opened and modified
+during a build that then fails must still survive the call and land
+on `org-agenda-new-buffers', exactly as after a successful build."
+  (org-mcp-test--asserting-modified-buffer-handoff
+    (let ((real (symbol-function 'org-agenda-list)))
+      (cl-letf (((symbol-function 'org-agenda-list)
+                 (lambda (&rest args)
+                   (apply real args)
+                   (error "Simulated agenda failure"))))
+        (org-mcp-test--should-get-agenda-day-error)))))
+
+(ert-deftest org-mcp-test-tool-get-agenda-spares-same-name-buffer ()
+  "Test org-get-agenda leaves an existing same-named buffer untouched.
+Pins the unique per-call private buffer name: a buffer already named
+`org-mcp--agenda-buffer-name' (a concurrent build's, or any
+coincidentally named one) must not be written into or killed by
+another call."
+  (org-mcp-test--with-temp-org-files
+      ((agenda-file org-mcp-test--agenda-basic-content))
+    (let ((preexisting
+           (get-buffer-create org-mcp--agenda-buffer-name)))
+      (unwind-protect
+          (progn
+            (with-current-buffer preexisting
+              (insert "sentinel"))
+            (org-mcp-test--call-get-agenda '((view . "day")))
+            (should (buffer-live-p preexisting))
+            (should
+             (string=
+              (with-current-buffer preexisting
+                (buffer-string))
+              "sentinel")))
+        (when (buffer-live-p preexisting)
+          (kill-buffer preexisting))))))
 
 (ert-deftest org-mcp-test-file-not-in-allowed-list-returns-error ()
   "Test that reading a file not in allowed list returns an error."

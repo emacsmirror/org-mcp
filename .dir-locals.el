@@ -51,6 +51,7 @@
                                                  (org-mcp-test--assert-edit-body-empty-timestamp . 1)
                                                  (org-mcp-test--asserting-no-modified-buffer-killed . 0)
                                                  (org-mcp-test--asserting-edit-body-kills-no-modified-buffer . 0)
+                                                 (org-mcp-test--asserting-modified-buffer-handoff . 0)
                                                  (org-mcp-test--with-id-fallback-scan . 1)
                                                  (org-mcp-test--assert-clear-done-closed . 1)
                                                  (org-mcp-test--assert-update-todo-error . 1)

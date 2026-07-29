@@ -243,8 +243,10 @@ Directory entries are excluded so they cannot be expanded by
     (nreverse out)))
 
 (defconst org-mcp--agenda-buffer-name " *org-mcp agenda*"
-  "Name of the private buffer `org-mcp--agenda-buffer-text' builds into.
-The leading space keeps it off `buffer-list'.")
+  "Base name of the private buffer `org-mcp--agenda-collect' builds into.
+Uniquified per call via `generate-new-buffer-name' so builds never
+share or steal a buffer.  The leading space keeps it off
+`buffer-list'.")
 
 (defun org-mcp--agenda-node-at-marker (marker)
   "Serialize the heading at MARKER to a bare node, or nil if unresolvable.
@@ -324,6 +326,21 @@ contribute no item but remain in the agenda text."
      (flush))
     (nreverse blocks)))
 
+(defun org-mcp--agenda-release-new-buffers ()
+  "Kill the file buffers the agenda build opened; return the spared ones.
+Kills each live, unmodified buffer in `org-agenda-new-buffers' and
+returns the list of live but modified ones.  Killing a modified file
+buffer would demand interactive confirmation (hanging the MCP request)
+or discard the changes, so those are spared for the caller to hand
+off."
+  (let (modified)
+    (dolist (buf org-agenda-new-buffers)
+      (when (buffer-live-p buf)
+        (if (buffer-modified-p buf)
+            (push buf modified)
+          (kill-buffer buf))))
+    modified))
+
 (defun org-mcp--agenda-collect (agenda-files build-fn)
   "Build an agenda over AGENDA-FILES via BUILD-FN under agenda isolation.
 BUILD-FN takes no arguments and populates the private agenda buffer
@@ -345,51 +362,68 @@ restriction lock is neutralized for the build: `org-agenda-restrict'
 and `org-agenda-overriding-restriction' are bound to nil, and the
 `org-restrict' symbol property on `org-agenda-files' (which the agenda
 honors above the dynamic variable) is cleared and restored, so the
-agenda is always built from AGENDA-FILES alone.  The caller must ensure
-AGENDA-FILES is non-nil."
+agenda is always built from AGENDA-FILES alone.
+`org-agenda-new-buffers' is bound to nil so file buffers the build
+opens are tracked privately: they are killed on exit rather than left
+on the user's global list, except that a buffer modified during the
+build is handed to the global list instead, since killing it would
+demand interactive confirmation or discard the changes.  The caller
+must ensure AGENDA-FILES is non-nil."
   (cl-assert agenda-files)
-  (let*
-      ((buffer-name org-mcp--agenda-buffer-name)
-       (org-agenda-files agenda-files)
-       (org-agenda-buffer-tmp-name buffer-name)
-       ;; Single-command dispatch names its buffer from the tmp-name
-       ;; above, but the composite path (`org-agenda-run-series')
-       ;; names it from `org-agenda-buffer-name', so bind that to the
-       ;; private name too or a composite view escapes into the
-       ;; user's real "*Org Agenda*" buffer.
-       (org-agenda-buffer-name buffer-name)
-       (org-agenda-buffer org-agenda-buffer)
-       (org-agenda-pre-window-conf nil)
-       (org-agenda-window-setup 'current-window)
-       (org-agenda-sticky nil)
-       (org-agenda-markers nil)
-       (org-agenda-this-buffer-name nil)
-       (org-agenda-last-prefix-arg nil)
-       (org-todo-keywords-for-agenda nil)
-       (org-done-keywords-for-agenda nil)
-       (org-agenda-start-day nil)
-       (org-agenda-contributing-files nil)
-       (org-agenda-restrict nil)
-       (org-agenda-overriding-restriction nil)
-       (org-agenda-compact-blocks nil)
-       (saved-restrict (get 'org-agenda-files 'org-restrict)))
-    (save-window-excursion
-      (unwind-protect
-          (progn
-            (put 'org-agenda-files 'org-restrict nil)
-            (funcall build-fn)
-            (let ((buf (get-buffer buffer-name)))
-              (unless buf
-                (org-mcp--tool-validation-error
-                 "Agenda command produced no agenda buffer; it may build a sparse tree or prompt for input"))
-              (with-current-buffer buf
-                (list
-                 (buffer-substring-no-properties
-                  (point-min) (point-max))
-                 org-starting-day (org-mcp--agenda-blocks)))))
-        (put 'org-agenda-files 'org-restrict saved-restrict)
-        (when-let* ((buf (get-buffer buffer-name)))
-          (kill-buffer buf))))))
+  (let ((modified-buffers nil))
+    (unwind-protect
+        (let*
+            ((buffer-name
+              (generate-new-buffer-name org-mcp--agenda-buffer-name))
+             (org-agenda-files agenda-files)
+             (org-agenda-buffer-tmp-name buffer-name)
+             ;; Single-command dispatch names its buffer from the
+             ;; tmp-name above, but the composite path
+             ;; (`org-agenda-run-series') names it from
+             ;; `org-agenda-buffer-name', so bind that to the private
+             ;; name too or a composite view escapes into the user's
+             ;; real "*Org Agenda*" buffer.
+             (org-agenda-buffer-name buffer-name)
+             (org-agenda-buffer org-agenda-buffer)
+             (org-agenda-pre-window-conf nil)
+             (org-agenda-window-setup 'current-window)
+             (org-agenda-sticky nil)
+             (org-agenda-markers nil)
+             (org-agenda-this-buffer-name nil)
+             (org-agenda-last-prefix-arg nil)
+             (org-todo-keywords-for-agenda nil)
+             (org-done-keywords-for-agenda nil)
+             (org-agenda-start-day nil)
+             (org-agenda-contributing-files nil)
+             (org-agenda-restrict nil)
+             (org-agenda-overriding-restriction nil)
+             (org-agenda-compact-blocks nil)
+             (org-agenda-new-buffers nil)
+             (saved-restrict (get 'org-agenda-files 'org-restrict)))
+          (save-window-excursion
+            (unwind-protect
+                (progn
+                  (put 'org-agenda-files 'org-restrict nil)
+                  (funcall build-fn)
+                  (let ((buf (get-buffer buffer-name)))
+                    (unless buf
+                      (org-mcp--tool-validation-error
+                       "Agenda command produced no agenda buffer; it may build a sparse tree or prompt for input"))
+                    (with-current-buffer buf
+                      (list
+                       (buffer-substring-no-properties
+                        (point-min) (point-max))
+                       org-starting-day (org-mcp--agenda-blocks)))))
+              (put 'org-agenda-files 'org-restrict saved-restrict)
+              (setq modified-buffers
+                    (org-mcp--agenda-release-new-buffers))
+              (when-let* ((buf (get-buffer buffer-name)))
+                (kill-buffer buf)))))
+      ;; Runs after the `let*' unwinds, so `org-agenda-new-buffers' is
+      ;; the caller's list again and the spared buffers land where the
+      ;; user's own agenda cleanup (`org-agenda-exit') will find them.
+      (setq org-agenda-new-buffers
+            (nconc modified-buffers org-agenda-new-buffers)))))
 
 (defun org-mcp--agenda-buffer-text (agenda-files start-day span)
   "Build `org-agenda-list' for AGENDA-FILES, period START-DAY and SPAN.

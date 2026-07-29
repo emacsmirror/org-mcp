@@ -87,6 +87,14 @@ org-mcp NEWS -- history of user-visible changes
 
 ** Bug Fixes
 
+*** Fixed `org-get-agenda' leaking buffers of files it opened
+    File buffers the agenda build had to open stayed alive on the
+    global `org-agenda-new-buffers' list until the user's own
+    `org-agenda-exit' killed them.  The tool now kills the buffers it
+    opened after each call (a buffer modified during the build is
+    handed to `org-agenda-new-buffers' instead), and builds into a
+    uniquely named private buffer.
+
 *** Fixed in-file archiving losing the subtree when the file is open
     When a buffer visited the file being archived within itself,
     `org-archive-subtree' pasted the archived copy into that buffer
