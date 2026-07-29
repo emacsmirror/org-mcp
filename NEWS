@@ -87,6 +87,25 @@ org-mcp NEWS -- history of user-visible changes
 
 ** Bug Fixes
 
+*** Fixed in-file archiving losing the subtree when the file is open
+    When a buffer visited the file being archived within itself,
+    `org-archive-subtree' pasted the archived copy into that buffer
+    instead of the tool's own, and the tool's subsequent source write
+    discarded the copy while reporting success.  The in-file move now
+    happens entirely in the tool's buffer.
+
+*** Fixed file identity checks under aliased paths
+    The file-modifying tools compared file paths textually, so a
+    buffer visiting an allowed file through a different path (a
+    symlink anywhere in either path, or a hard link) was missed: the
+    unsaved-changes guard did not block the write, and the buffer was
+    left stale instead of refreshed afterwards.  Buffers are now
+    matched by truename or by inode and device numbers, as
+    `find-buffer-visiting' does.  Likewise,
+    `org-archive-subtree' now recognizes an `org-archive-location'
+    naming the source file through a different path as in-file
+    archiving rather than a separate archive file.
+
 *** Fixed `org-edit-body' on a drawer-only node before another heading
     Adding a first paragraph with an empty `old_body' to a headline
     whose only content is drawers (`:PROPERTIES:'/`:LOGBOOK:') failed

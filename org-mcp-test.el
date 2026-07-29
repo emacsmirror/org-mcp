@@ -2071,6 +2071,16 @@ The file part before `::' is empty, so archiving moves the subtree
 under a heading within the source file itself rather than to a
 separate file.")
 
+(defconst org-mcp-test--content-archive-explicit-file-location
+  "* TODO Task to Archive
+:PROPERTIES:
+:ARCHIVE:  %s::* Archived Tasks
+:END:
+Some content here."
+  "Task whose `:ARCHIVE:' property has an explicit file part.
+The `%s' placeholder receives the path used as the location's file
+part before `::'.")
+
 (defconst org-mcp-test--content-archive-nested
   "* Parent
 Parent body.
@@ -2320,6 +2330,19 @@ message string."
           ,@body)
        (org-mcp-disable))))
 
+(defmacro org-mcp-test--with-isolated-org-id (&rest body)
+  "Run BODY with org-id state isolated from the session's global DB.
+Binds `org-id-track-globally' t, `org-id-locations-file' nil (so
+nothing is loaded from or saved to disk), and `org-id-locations' and
+`org-id-files' nil, so ID minting and registration stay in the
+let-bound state and unwind with it."
+  (declare (indent 0) (debug (body)))
+  `(let ((org-id-track-globally t)
+         (org-id-locations-file nil)
+         (org-id-locations nil)
+         (org-id-files nil))
+     ,@body))
+
 (defmacro org-mcp-test--with-temp-org-files (file-specs &rest body)
   "Create temporary Org files, execute BODY, and ensure cleanup.
 FILE-SPECS is a list of file specifications.
@@ -2366,8 +2389,9 @@ Returns the value of the last form in BODY."
                ;; mark them used to avoid spurious unused-lexical
                ;; warnings.
                (ignore ,@vars)
-               (org-mcp-test--with-enabled
-                 ,@body)))
+               (org-mcp-test--with-isolated-org-id
+                 (org-mcp-test--with-enabled
+                   ,@body))))
          ,@cleanups))))
 
 (defmacro org-mcp-test--with-id-tracking
@@ -2375,16 +2399,14 @@ Returns the value of the last form in BODY."
   "Set up org-id tracking with ID-LOCATIONS and run BODY.
 ALLOWED-FILES is the list of files to bind to `org-mcp-allowed-files'.
 ID-LOCATIONS is a list of (ID . FILE) cons cells to register.
-Sets up `org-id-track-globally' and `org-id-locations-file',
+Isolates org-id state via `org-mcp-test--with-isolated-org-id',
 then registers each ID location."
   (declare (indent 2) (debug (form form body)))
-  `(let ((org-id-track-globally t)
-         (org-id-locations-file nil) ; Prevent saving to disk
-         (org-id-locations nil)
-         (org-mcp-allowed-files ,allowed-files))
-     (dolist (id-loc ,id-locations)
-       (org-id-add-location (car id-loc) (cdr id-loc)))
-     ,@body))
+  `(org-mcp-test--with-isolated-org-id
+     (let ((org-mcp-allowed-files ,allowed-files))
+       (dolist (id-loc ,id-locations)
+         (org-id-add-location (car id-loc) (cdr id-loc)))
+       ,@body)))
 
 (defmacro org-mcp-test--with-id-setup
     (file-var initial-content ids &rest body)
@@ -2401,11 +2423,8 @@ The created temp file is automatically added to `org-mcp-allowed-files'."
          (mapcar (lambda (id) (cons id ,file-var)) ,ids)
        ,@body)))
 
-(defmacro org-mcp-test--with-archive-setup
-    (file-var initial-content ids &rest body)
-  "Like `org-mcp-test--with-id-setup' with org-archive options pinned.
-FILE-VAR is bound to the temp file, INITIAL-CONTENT seeds it, and
-IDS lists IDs to register, as in `org-mcp-test--with-id-setup'.
+(defmacro org-mcp-test--with-archive-defaults (&rest body)
+  "Run BODY with org-archive options pinned to their stock defaults.
 Binds `org-archive-location', `org-archive-default-command',
 `org-archive-subtree-save-file-p', `org-archive-file-header-format',
 and `org-archive-mark-done' to their stock defaults so archive
@@ -2415,13 +2434,8 @@ than the developer's or CI's global configuration.  Also binds
 land at column 0 regardless of Org version: its default flipped from t
 to nil in Org 9.5, and the older t default indents drawer and body,
 which the archive assertions do not expect.
-A test needing a non-default value rebinds it inside BODY.
-Finally binds `default-archive-file' to the source file's default
-archive path (its name with `_archive' appended) via
-`org-mcp-test--with-archive-file', discarding any buffer visiting that
-file and deleting it on exit.  A test archiving to a non-default
-location wraps BODY in its own `org-mcp-test--with-archive-file'."
-  (declare (indent 3) (debug (symbolp form form body)))
+A test needing a non-default value rebinds it inside BODY."
+  (declare (indent 0) (debug (body)))
   `(let ((org-archive-location "%s_archive::")
          (org-archive-default-command 'org-archive-subtree)
          (org-archive-subtree-save-file-p 'from-org)
@@ -2429,6 +2443,23 @@ location wraps BODY in its own `org-mcp-test--with-archive-file'."
           "\nArchived entries from file %s\n\n")
          (org-archive-mark-done nil)
          (org-adapt-indentation nil))
+     ,@body))
+
+(defmacro org-mcp-test--with-archive-setup
+    (file-var initial-content ids &rest body)
+  "Like `org-mcp-test--with-id-setup' with org-archive options pinned.
+FILE-VAR is bound to the temp file, INITIAL-CONTENT seeds it, and
+IDS lists IDs to register, as in `org-mcp-test--with-id-setup'.
+Pins the org-archive options via
+`org-mcp-test--with-archive-defaults'; a test needing a non-default
+value rebinds it inside BODY.
+Finally binds `default-archive-file' to the source file's default
+archive path (its name with `_archive' appended) via
+`org-mcp-test--with-archive-file', discarding any buffer visiting that
+file and deleting it on exit.  A test archiving to a non-default
+location wraps BODY in its own `org-mcp-test--with-archive-file'."
+  (declare (indent 3) (debug (symbolp form form body)))
+  `(org-mcp-test--with-archive-defaults
      (org-mcp-test--with-id-setup ,file-var ,initial-content ,ids
        (org-mcp-test--with-archive-file default-archive-file
            (concat ,file-var "_archive")
@@ -2445,6 +2476,33 @@ BODY is the code to execute with the buffer."
          (progn
            ,@body)
        (kill-buffer ,buffer))))
+
+(defmacro org-mcp-test--with-symlinked-org-file
+    (real-var alias-var content &rest body)
+  "Run BODY with an Org file reachable through a directory symlink.
+Writes CONTENT to a file bound to REAL-VAR inside a fresh temporary
+directory; ALIAS-VAR is bound to the same file's path through a
+symlinked alias of that directory and is the sole entry in
+`org-mcp-allowed-files'.  Runs BODY with org-mcp enabled and org-id
+tracking isolated from the global DB (via
+`org-mcp-test--with-id-tracking'); deletes the symlink and the
+directory on exit."
+  (declare (indent 3) (debug (symbolp symbolp form body)))
+  (let ((real-dir (gensym "real-dir"))
+        (link-dir (gensym "link-dir")))
+    `(let* ((,real-dir (make-temp-file "org-mcp-test-real" t))
+            (,link-dir (concat ,real-dir "-link"))
+            (,real-var (expand-file-name "test.org" ,real-dir))
+            (,alias-var (expand-file-name "test.org" ,link-dir)))
+       (unwind-protect
+           (progn
+             (make-symbolic-link ,real-dir ,link-dir)
+             (write-region ,content nil ,real-var)
+             (org-mcp-test--with-id-tracking (list ,alias-var) nil
+               (org-mcp-test--with-enabled
+                 ,@body)))
+         (delete-file ,link-dir)
+         (delete-directory ,real-dir t)))))
 
 (defmacro org-mcp-test--asserting-no-modified-buffer-killed
     (&rest body)
@@ -2648,8 +2706,7 @@ Executes BODY with org-mcp enabled and standard variables set."
         (tag-al (or tag-alist ''("work" "personal" "urgent"))))
     `(org-mcp-test--with-temp-org-files ((,file-var ,initial-content))
        (let ((org-todo-keywords ,todo-kw)
-             (org-tag-alist ,tag-al)
-             (org-id-locations-file nil))
+             (org-tag-alist ,tag-al))
          ,(if ids
               `(org-mcp-test--with-id-tracking (list ,file-var)
                    (mapcar (lambda (id) (cons id ,file-var)) ,ids)
@@ -3236,6 +3293,7 @@ TRACK-GLOBALLY binds `org-id-track-globally'.  `test-file' holds
      (let ((org-id-track-globally ,track-globally)
            (org-id-locations-file nil)
            (org-id-locations nil)
+           (org-id-files nil)
            (org-mcp-allowed-files (list test-file))
            (org-todo-keywords
             '((sequence "TODO" "IN-PROGRESS" "|" "DONE"))))
@@ -3380,12 +3438,13 @@ TODO-KEYWORDS and TAG-ALIST bind `org-todo-keywords'/`org-tag-alist'
 for the call."
  (org-mcp-test--with-edit-headline-env todo-keywords tag-alist
                                        initial-content
+   ;; The registrations land in the org-id state let-bound by
+   ;; `org-mcp-test--with-temp-org-files' (via
+   ;; `org-mcp-test--with-edit-headline-env'), so they are still live
+   ;; for the tool call below.
    (when ids-to-register
-     (let ((org-id-track-globally t)
-           (org-id-locations-file nil)
-           (org-id-locations nil))
-       (dolist (id ids-to-register)
-         (org-id-add-location id test-file))))
+     (dolist (id ids-to-register)
+       (org-id-add-location id test-file)))
    (let* ((uri
            (if (string-prefix-p "org-" headline-path-or-uri)
                headline-path-or-uri
@@ -5175,28 +5234,136 @@ reaching `org-mcp--validate-todo-state'."
                                 nil
                                 t))))))))
 
+(defun org-mcp-test--assert-update-blocked-by-modified-buffer
+    (buffer-file disk-file uri-file)
+  "Assert the unsaved-changes guard sees a buffer visiting BUFFER-FILE.
+Open BUFFER-FILE and insert an unrelated heading so the buffer has
+unsaved changes, then update `Original Task' via URI-FILE expecting
+the guard error; verify DISK-FILE is unchanged and the buffer keeps
+its unsaved changes.  BUFFER-FILE and URI-FILE may be path aliases
+of, or identical to, DISK-FILE."
+  (org-mcp-test--with-file-buffer buffer buffer-file
+    (with-current-buffer buffer
+      (goto-char (point-max))
+      (insert "\n* TODO Another Task")
+      (should (buffer-modified-p)))
+    (org-mcp-test--call-update-todo-state-expecting-error
+     disk-file
+     (format "org-headline://%s#Original%%20Task" uri-file)
+     "TODO"
+     "IN-PROGRESS"
+     "has unsaved")
+    (with-current-buffer buffer
+      (should (buffer-modified-p)))))
+
 (ert-deftest org-mcp-test-update-todo-state-with-modified-buffer ()
   "Test TODO state update fails when buffer has unsaved changes."
-  (let ((test-content org-mcp-test--content-simple-todo))
-    (org-mcp-test--with-temp-org-files ((test-file test-content))
-      ;; Open the file in a buffer and modify it elsewhere
-      (org-mcp-test--with-file-buffer buffer test-file
-        ;; Make a modification at an unrelated location
-        (with-current-buffer buffer
-          (goto-char (point-max))
-          (insert "\n* TODO Another Task\nAdded in buffer.")
-          ;; Buffer is now modified but not saved
-          (should (buffer-modified-p)))
+  (org-mcp-test--with-temp-org-files
+      ((test-file org-mcp-test--content-simple-todo))
+    (org-mcp-test--assert-update-blocked-by-modified-buffer
+     test-file test-file test-file)))
 
-        ;; Try to update while buffer has unsaved changes
-        (let ((resource-uri
-               (format "org-headline://%s#Original%%20Task"
-                       test-file)))
-          (org-mcp-test--call-update-todo-state-expecting-error
-           test-file resource-uri "TODO" "IN-PROGRESS")
-          ;; Verify buffer still has unsaved changes
-          (with-current-buffer buffer
-            (should (buffer-modified-p))))))))
+(ert-deftest
+    org-mcp-test-update-todo-state-modified-buffer-via-symlink
+    ()
+  "Pin that the unsaved-changes guard matches buffers by file identity.
+The allowed entry reaches the file through a directory symlink while
+the user's buffer visits the real path, so a textual comparison of
+visited file names never matches and the tool would overwrite the
+user's unsaved changes on disk."
+  (org-mcp-test--with-symlinked-org-file
+      real-file alias-file
+      org-mcp-test--content-simple-todo
+    (org-mcp-test--assert-update-blocked-by-modified-buffer
+     real-file real-file alias-file)))
+
+(ert-deftest
+    org-mcp-test-update-todo-state-refreshes-buffer-via-symlink
+    ()
+  "Pin that the post-write refresh matches buffers by file identity.
+The tool writes through a symlinked allowed entry while the user's
+buffer visits the real path, so a textual comparison of visited file
+names would leave that buffer showing stale pre-write content."
+  (org-mcp-test--with-symlinked-org-file
+      real-file alias-file
+      org-mcp-test--content-with-id-todo
+    (let ((org-todo-keywords
+           '((sequence "TODO" "IN-PROGRESS" "|" "DONE"))))
+      (org-mcp-test--with-file-buffer buffer real-file
+        (org-mcp-test--update-todo-state-and-check
+         (format "org-headline://%s#Task%%20with%%20ID" alias-file)
+         "TODO"
+         "IN-PROGRESS"
+         real-file
+         org-mcp-test--expected-task-with-id-in-progress-regex)
+        (org-mcp-test--verify-buffer-matches
+         buffer
+         org-mcp-test--expected-task-with-id-in-progress-regex)))))
+
+(ert-deftest
+    org-mcp-test-update-todo-state-modified-buffer-via-hard-link
+    ()
+  "Pin that the unsaved-changes guard matches buffers by inode identity.
+The user's buffer visits the file through a hard link, whose truename
+differs from the allowed entry's, so truename matching alone would
+miss the buffer's unsaved changes and the tool would overwrite them."
+  (let* ((dir (make-temp-file "org-mcp-test-hard" t))
+         (real-file (expand-file-name "test.org" dir))
+         (hard-file (expand-file-name "alias.org" dir)))
+    (unwind-protect
+        (progn
+          (write-region
+           org-mcp-test--content-simple-todo nil real-file)
+          (add-name-to-file real-file hard-file)
+          (let ((org-mcp-allowed-files (list real-file)))
+            (org-mcp-test--with-enabled
+              (org-mcp-test--assert-update-blocked-by-modified-buffer
+               hard-file real-file real-file))))
+      (delete-directory dir t))))
+
+(ert-deftest
+    org-mcp-test-update-todo-state-modified-buffer-retargeted-symlink
+    ()
+  "Pin that the guard matches a buffer by exact visited file name.
+The buffer visits the file through the allowed symlinked path, whose
+target directory is then repointed; the buffer's cached truename and
+inode both describe the old target, so only an exact visited-name
+comparison can still associate the buffer with the tool's path."
+  (let* ((old-dir (make-temp-file "org-mcp-test-old" t))
+         (new-dir (make-temp-file "org-mcp-test-new" t))
+         (link-dir (concat old-dir "-link"))
+         (alias-file (expand-file-name "test.org" link-dir)))
+    (unwind-protect
+        (progn
+          (write-region
+           org-mcp-test--content-simple-todo
+           nil
+           (expand-file-name "test.org" old-dir))
+          (write-region
+           org-mcp-test--content-simple-todo
+           nil
+           (expand-file-name "test.org" new-dir))
+          (make-symbolic-link old-dir link-dir)
+          (let ((org-mcp-allowed-files (list alias-file)))
+            (org-mcp-test--with-enabled
+              (org-mcp-test--with-file-buffer buffer alias-file
+                (with-current-buffer buffer
+                  (goto-char (point-max))
+                  (insert "\n* TODO Another Task")
+                  (should (buffer-modified-p)))
+                (delete-file link-dir)
+                (make-symbolic-link new-dir link-dir)
+                (org-mcp-test--call-update-todo-state-expecting-error
+                 alias-file
+                 (format "org-headline://%s#Original%%20Task"
+                         alias-file)
+                 "TODO" "IN-PROGRESS"
+                 "has unsaved")
+                (with-current-buffer buffer
+                  (should (buffer-modified-p)))))))
+      (delete-file link-dir)
+      (delete-directory old-dir t)
+      (delete-directory new-dir t))))
 
 (ert-deftest org-mcp-test-update-todo-state-nonexistent-id ()
   "Test TODO state update fails for non-existent UUID."
@@ -7219,13 +7386,11 @@ parsing runs."
 
 (ert-deftest org-mcp-test-edit-headline-id-not-found ()
   "Test error when ID doesn't exist."
-  (let ((org-id-track-globally nil)
-        (org-id-locations-file nil))
-    (org-mcp-test--call-edit-headline-expecting-error
-     org-mcp-test--content-nested-siblings
-     "org-id://non-existent-id-12345"
-     "Whatever"
-     "Should Fail")))
+  (org-mcp-test--call-edit-headline-expecting-error
+   org-mcp-test--content-nested-siblings
+   "org-id://non-existent-id-12345"
+   "Whatever"
+   "Should Fail"))
 
 (ert-deftest org-mcp-test-edit-headline-with-slash ()
   "Test renaming a headline containing a slash character.
@@ -7291,14 +7456,12 @@ This test documents the first-match behavior when duplicate headlines exist."
 
 (ert-deftest org-mcp-test-edit-headline-creates-id ()
   "Test that renaming a headline creates an Org ID and returns it."
-  (let ((org-id-track-globally t)
-        (org-id-locations-file (make-temp-file "test-org-id")))
-    (org-mcp-test--call-edit-headline-and-check
-     org-mcp-test--content-nested-siblings
-     "Parent%20Task/Third%20Child%20%233"
-     "Third Child #3"
-     "Renamed Child"
-     org-mcp-test--pattern-renamed-headline-with-id)))
+  (org-mcp-test--call-edit-headline-and-check
+   org-mcp-test--content-nested-siblings
+   "Parent%20Task/Third%20Child%20%233"
+   "Third Child #3"
+   "Renamed Child"
+   org-mcp-test--pattern-renamed-headline-with-id))
 
 
 (ert-deftest org-mcp-test-edit-headline-hierarchy ()
@@ -8291,6 +8454,95 @@ resolves via `resources/read' immediately -- with no change to
       (org-mcp-test--verify-file-matches
        test-file org-mcp-test--expected-archive-infile-source-regex)
       (should-not (file-exists-p default-archive-file)))))
+
+(ert-deftest org-mcp-test-archive-subtree-in-file-with-open-buffer ()
+  "Pin in-file archiving with the source open in a saved buffer.
+`org-archive-subtree' resolves its paste target by visited file name,
+which finds the user's buffer instead of the tool's own; the archived
+copy then lands in that buffer and the tool's source write discards
+it, losing the subtree everywhere while reporting success."
+  (org-mcp-test--with-archive-setup test-file
+      org-mcp-test--content-archive-infile-location
+      nil
+    (org-mcp-test--with-file-buffer buffer test-file
+      (org-mcp-test--archive-subtree
+       (org-mcp-test--archive-task-uri test-file) test-file)
+      (org-mcp-test--verify-file-matches
+       test-file org-mcp-test--expected-archive-infile-source-regex)
+      (org-mcp-test--verify-buffer-matches
+       buffer org-mcp-test--expected-archive-infile-source-regex))))
+
+(defmacro org-mcp-test--with-symlinked-archive-location
+    (real-var alias-var location &rest body)
+  "Run BODY with a symlinked Org file whose `:ARCHIVE:' names LOCATION.
+Pins the org-archive defaults, then sets up the
+`org-mcp-test--with-symlinked-org-file' fixture (binding REAL-VAR and
+ALIAS-VAR) seeded with
+`org-mcp-test--content-archive-explicit-file-location' whose file
+part is LOCATION, evaluated with REAL-VAR and ALIAS-VAR in scope."
+  (declare (indent 3) (debug (symbolp symbolp form body)))
+  `(org-mcp-test--with-archive-defaults
+     (org-mcp-test--with-symlinked-org-file
+         ,real-var ,alias-var
+         (format org-mcp-test--content-archive-explicit-file-location
+                 ,location)
+       ,@body)))
+
+(ert-deftest org-mcp-test-archive-subtree-alias-of-source-location ()
+  "Pin in-file archiving when the location names the source by an alias.
+The `:ARCHIVE:' file part names the source file under another path
+\(the tool reaches the file through a directory symlink), so the
+location resolves to the source itself and archiving stays in-file.
+A textual path comparison would treat the location as a separate
+archive file."
+  (org-mcp-test--with-symlinked-archive-location real-file alias-file
+                                                 real-file
+    (org-mcp-test--archive-subtree
+     (org-mcp-test--archive-task-uri alias-file) real-file)
+    (org-mcp-test--verify-file-matches
+     real-file org-mcp-test--expected-archive-infile-source-regex)))
+
+(ert-deftest
+    org-mcp-test-archive-subtree-alias-of-source-with-open-buffer
+    ()
+  "Pin aliased in-file archiving with the real path open in a buffer.
+The `:ARCHIVE:' file part names the source's real path while the tool
+works through the symlinked alias; a paste target resolved by visited
+file name would find the user's real-path buffer instead of the
+tool's own, and the archived copy would be lost when the source is
+written."
+  (org-mcp-test--with-symlinked-archive-location real-file alias-file
+                                                 real-file
+    (org-mcp-test--with-file-buffer buffer real-file
+      (org-mcp-test--archive-subtree
+       (org-mcp-test--archive-task-uri alias-file) real-file)
+      (org-mcp-test--verify-file-matches
+       real-file org-mcp-test--expected-archive-infile-source-regex)
+      (org-mcp-test--verify-buffer-matches
+       buffer org-mcp-test--expected-archive-infile-source-regex))))
+
+(ert-deftest org-mcp-test-archive-subtree-unsaved-dest-via-symlink ()
+  "Pin that the archive-destination unsaved guard matches by identity.
+The `:ARCHIVE:' location names a genuinely separate archive file
+through the symlinked alias directory while the user's buffer visits
+it via the real path with unsaved changes; a textual comparison in
+the archive tool's destination guard would miss that buffer and
+force-save over its edits."
+  (org-mcp-test--with-symlinked-archive-location real-file alias-file
+                                                 (expand-file-name
+                                                  "archive.org"
+                                                  (file-name-directory
+                                                   alias-file))
+    (org-mcp-test--with-file-buffer buffer
+        (expand-file-name "archive.org"
+                          (file-name-directory real-file))
+      (with-current-buffer buffer
+        (insert "* Unsaved archive note")
+        (should (buffer-modified-p)))
+      (org-mcp-test--assert-archive-error
+          real-file
+        (org-mcp-test--archive-task-uri alias-file)
+        org-mcp-test--archive-unsaved-error-regex))))
 
 (ert-deftest org-mcp-test-archive-subtree-kills-opened-archive-buffer
     ()

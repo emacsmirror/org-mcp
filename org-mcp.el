@@ -423,45 +423,89 @@ DATE is returned unchanged for `org-agenda-list' to resolve."
             (nth 0 gregorian)
             (nth 1 gregorian))))
 
+(defun org-mcp--buffer-visits-file-p
+    (buf visited-name truename attributes)
+  "Return non-nil when BUF visits the file TRUENAME identifies.
+VISITED-NAME is the file's expanded path, TRUENAME its abbreviated
+truename, and ATTRIBUTES its `file-attributes'.  Matches by exact
+visited name, by truename, or, under `buffer-file-numbers-unique',
+by the file's inode and device numbers -- the identity tiers
+`find-buffer-visiting' uses."
+  ;; (INODE DEVICE), the representation `buffer-file-number' caches;
+  ;; `file-attribute-file-identifier' would need Emacs 29.
+  (let ((number (nthcdr 10 attributes)))
+    (with-current-buffer buf
+      (and buffer-file-name
+           (or (equal visited-name buffer-file-name)
+               (equal truename buffer-file-truename)
+               (and buffer-file-numbers-unique
+                    (car-safe number)
+                    (equal buffer-file-number number)
+                    ;; The cached number can be stale (the inode
+                    ;; reused by another file after deletion), so
+                    ;; require the buffer's file to still carry the
+                    ;; same identity, as `find-buffer-visiting'
+                    ;; does.
+                    (file-exists-p buffer-file-name)
+                    (equal
+                     (file-attributes buffer-file-truename)
+                     attributes)))))))
+
+(defun org-mcp--buffers-visiting-file (file-path)
+  "Return all live buffers visiting FILE-PATH, under any name.
+Matches each buffer with `org-mcp--buffer-visits-file-p', so buffers
+visiting FILE-PATH through a symlink, hard link, or other path alias
+are included.  Unlike `find-buffer-visiting', returns every matching
+buffer, not only the first."
+  (let* ((visited-name (expand-file-name file-path))
+         (truename (abbreviate-file-name (file-truename file-path)))
+         (attributes (file-attributes truename))
+         (buffers nil))
+    (dolist (buf (buffer-list))
+      (when (org-mcp--buffer-visits-file-p
+             buf visited-name truename attributes)
+        (push buf buffers)))
+    (nreverse buffers)))
+
 (defun org-mcp--refresh-file-buffers
     (file-path &optional except-buffer)
   "Refresh all buffers visiting FILE-PATH.
+Buffers visiting FILE-PATH under a different name (e.g. through a
+symlink) are matched by `org-mcp--buffers-visiting-file'.
 Preserves narrowing state across the refresh operation.
 EXCEPT-BUFFER, when non-nil, is skipped: callers that have just
 written FILE-PATH from a buffer pass that buffer so it is not
 reverted into itself (and its revert hooks not fired needlessly)."
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (when-let* ((buf-file (buffer-file-name)))
-        (when (and (string= buf-file file-path)
-                   (not (eq buf except-buffer)))
-          (let ((was-narrowed (buffer-narrowed-p))
-                (narrow-start nil)
-                (narrow-end nil))
-            ;; Save narrowing markers if narrowed
-            (when was-narrowed
-              (setq narrow-start (point-min-marker))
-              (setq narrow-end (point-max-marker)))
-            (condition-case err
-                (unwind-protect
-                    (progn
-                      (revert-buffer t t t)
-                      ;; Check if buffer was modified by hooks
-                      (when (buffer-modified-p)
-                        (org-mcp--tool-validation-error
-                         "Buffer for file %s was modified during \
+  (dolist (buf (org-mcp--buffers-visiting-file file-path))
+    (unless (eq buf except-buffer)
+      (with-current-buffer buf
+        (let ((was-narrowed (buffer-narrowed-p))
+              (narrow-start nil)
+              (narrow-end nil))
+          ;; Save narrowing markers if narrowed
+          (when was-narrowed
+            (setq narrow-start (point-min-marker))
+            (setq narrow-end (point-max-marker)))
+          (condition-case err
+              (unwind-protect
+                  (progn
+                    (revert-buffer t t t)
+                    ;; Check if buffer was modified by hooks
+                    (when (buffer-modified-p)
+                      (org-mcp--tool-validation-error
+                       "Buffer for file %s was modified during \
 refresh.  Check your `after-revert-hook' for functions that modify \
 the buffer"
-                         file-path)))
-                  ;; Restore narrowing even if revert fails
-                  (when was-narrowed
-                    (narrow-to-region narrow-start narrow-end)))
-              (error
-               (org-mcp--tool-validation-error
-                "Failed to refresh buffer for file %s: %s. \
+                       file-path)))
+                ;; Restore narrowing even if revert fails
+                (when was-narrowed
+                  (narrow-to-region narrow-start narrow-end)))
+            (error
+             (org-mcp--tool-validation-error
+              "Failed to refresh buffer for file %s: %s. \
 Check your Emacs hooks (`before-revert-hook', \
 `after-revert-hook', `revert-buffer-function')"
-                file-path (error-message-string err))))))))))
+              file-path (error-message-string err)))))))))
 
 (defun org-mcp--complete-and-save (response-alist)
   "Create ID if needed, save the visited file, return JSON.
@@ -485,17 +529,17 @@ RESPONSE-ALIST is an alist of response fields."
 
 (defun org-mcp--fail-if-modified (file-path operation)
   "Check if FILE-PATH has unsaved change in any buffer.
-OPERATION is a string describing the operation for error messages."
-  (dolist (buf (buffer-list))
-    (with-current-buffer buf
-      (when (and (buffer-file-name)
-                 (string= (buffer-file-name) file-path)
-                 (buffer-modified-p))
-        (org-mcp--tool-validation-error
-         (concat
-          "Cannot %s: an Emacs buffer visiting this file has unsaved "
-          "changes; ask the user to save it (C-x C-s) and retry")
-         operation)))))
+OPERATION is a string describing the operation for error messages.
+Buffers visiting FILE-PATH under a different name (e.g. through a
+symlink) are matched by `org-mcp--buffers-visiting-file'."
+  (when (cl-some
+         #'buffer-modified-p
+         (org-mcp--buffers-visiting-file file-path))
+    (org-mcp--tool-validation-error
+     (concat
+      "Cannot %s: an Emacs buffer visiting this file has unsaved "
+      "changes; ask the user to save it (C-x C-s) and retry")
+     operation)))
 
 (defmacro org-mcp--with-org-file (file-path &rest body)
   "Execute BODY in a temp Org buffer with file at FILE-PATH.
@@ -2625,37 +2669,37 @@ MCP Parameters:
       (org-mcp--goto-headline-from-uri
        headline-path (string-prefix-p org-mcp--uri-id-prefix uri))
       (let*
-          ((archive-file
-            (let* ((location
-                    (or (org-entry-get nil "ARCHIVE" 'inherit)
-                        org-archive-location))
-                   (file
-                    (car
-                     ;; `org-archive--compute-location' is an
-                     ;; Org-internal function with no public
-                     ;; equivalent: it expands the `%s'/`::heading'
-                     ;; spec that the public `org-archive-location'
-                     ;; stores raw.  This pre-flight resolution must
-                     ;; match what `org-archive-subtree' itself
-                     ;; resolves, or the unsaved-changes guard below
-                     ;; checks the wrong file.
-                     (condition-case err
-                         (org-archive--compute-location location)
-                       (error
-                        ;; A malformed location (e.g. an `:ARCHIVE:'
-                        ;; spec missing `::') is user-controlled, so
-                        ;; report it through the tool-error channel
-                        ;; rather than as a JSON-RPC internal error.
-                        (org-mcp--tool-validation-error
-                         "Invalid archive location %S: %s"
-                         location (error-message-string err)))))))
-              ;; FILE is a string in every supported Org; assert it so
-              ;; a future return-shape change fails clearly here
-              ;; rather than as an opaque downstream type error.
-              (cl-assert (stringp file))
-              file))
+          ((archive-location
+            (let ((location
+                   (or (org-entry-get nil "ARCHIVE" 'inherit)
+                       org-archive-location)))
+              ;; `org-archive--compute-location' is an Org-internal
+              ;; function with no public equivalent: it expands the
+              ;; `%s'/`::heading' spec that the public
+              ;; `org-archive-location' stores raw.  This pre-flight
+              ;; resolution must match what `org-archive-subtree'
+              ;; itself resolves, or the unsaved-changes guard below
+              ;; checks the wrong file.
+              (condition-case err
+                  (org-archive--compute-location location)
+                (error
+                 ;; A malformed location (e.g. an `:ARCHIVE:'
+                 ;; spec missing `::') is user-controlled, so
+                 ;; report it through the tool-error channel
+                 ;; rather than as a JSON-RPC internal error.
+                 (org-mcp--tool-validation-error
+                  "Invalid archive location %S: %s"
+                  location (error-message-string err))))))
+           (archive-file
+            (progn
+              ;; The file part is a string in every supported Org;
+              ;; assert it so a future return-shape change fails
+              ;; clearly here rather than as an opaque downstream
+              ;; type error.
+              (cl-assert (stringp (car archive-location)))
+              (car archive-location)))
            (separate-archive
-            (not (string= archive-file (buffer-file-name))))
+            (not (file-equal-p archive-file (buffer-file-name))))
            ;; Snapshot, before `org-archive-subtree' runs, whether the
            ;; user already had the separate archive file open.  The
            ;; cleanup below kills only a buffer the tool itself opened,
@@ -2679,7 +2723,32 @@ MCP Parameters:
                 ;; move, so it must run inside this `unwind-protect': a
                 ;; throw mid-archive would otherwise leak the buffer it
                 ;; opened, since the cleanup below would never run.
-                (org-archive-subtree)
+                (if separate-archive
+                    (org-archive-subtree)
+                  ;; In-file archive: `org-archive-subtree' re-resolves
+                  ;; the location itself and picks its paste buffer
+                  ;; from the file part by visited name, which can
+                  ;; find another buffer visiting this file instead of
+                  ;; the current one; the copy pasted there would be
+                  ;; lost when the source is written below.  Force an
+                  ;; empty file part so org-archive selects the
+                  ;; current buffer before any buffer lookup runs.
+                  (let ((org-archive-subtree-add-inherited-tags
+                         ;; With a nil file part org-archive cannot
+                         ;; recognize the move as in-file, so the
+                         ;; default `infile' would stop copying
+                         ;; inherited tags; this archive is in-file,
+                         ;; so `infile' means t here.
+                         (if (eq
+                              org-archive-subtree-add-inherited-tags
+                              'infile)
+                             t
+                           org-archive-subtree-add-inherited-tags)))
+                    (cl-letf (((symbol-function
+                                'org-archive--compute-location)
+                               (lambda (&rest _)
+                                 (cons nil (cdr archive-location)))))
+                      (org-archive-subtree))))
                 (let ((archive-buffer
                        (and separate-archive
                             (find-buffer-visiting archive-file))))
